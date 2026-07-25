@@ -1,8 +1,8 @@
 # MetaGLens Skills: AI-orchestrated metagenomics: reads → MAGs → annotation
 
-[![MetaGLens workflow demonstration](assets/metaglens-workflow-demo.gif)](assets/metaglens-overview.mp4?raw=1)
+![MetaGLens workflow demonstration](assets/metaglens-workflow-demo.gif)
 
-*The demonstration loops automatically. Click it to play the full MP4 video.*
+*The demonstration loops automatically.*
 
 MetaGLens Skills is a modular Codex skill bundle for designing reproducible
 shotgun-metagenomics workflows from paired raw reads to metagenome-assembled
@@ -15,18 +15,24 @@ orchestrated through the main `metaglens` skill.
 
 ## Workflow
 
-```mermaid
-flowchart LR
-    A["Paired shotgun reads"] --> B["Quality control"]
-    B --> C["Assembly"]
-    C --> D["Read mapping and depth"]
-    D --> E["Genome binning"]
-    E --> F["MAG quality assessment"]
-    F --> G["Dereplication"]
-    G --> H["Taxonomic classification"]
-    H --> I["Functional annotation"]
-    I --> J["Methods and references"]
-```
+1. **Project setup (`00_setup`)** — inspect software environments, discover
+   paired samples, initialize directories, and record provenance.
+2. **Quality control (`01_qc`)** — filter and trim raw reads, with optional host
+   and PhiX depletion.
+3. **Assembly (`02_assembly`)** — assemble each sample independently or perform
+   a co-assembly, then retain contigs above the selected length threshold.
+4. **Read mapping (`03_mapping`)** — align quality-controlled reads to contigs
+   and calculate coverage profiles.
+5. **Genome binning (`04_binning`)** — reconstruct draft genomes with multiple
+   binners and optionally refine the consensus with DAS Tool.
+6. **MAG quality assessment (`05_checkm`)** — estimate completeness and
+   contamination with CheckM2 and retain MAGs that meet the selected criteria.
+7. **Dereplication (`06_derep`)** — cluster similar MAGs by average nucleotide
+   identity and retain representative genomes.
+8. **Taxonomic classification (`07_taxonomy`)** — classify MAGs with GTDB-Tk or
+   profile reads with Kraken 2 and Bracken.
+9. **Functional annotation (`08_annotation`)** — predict genes, assign
+   functions, and assemble execution-backed Methods and references.
 
 ## Included skills
 
