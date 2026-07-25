@@ -2,7 +2,6 @@
 
 ![MetaGLens workflow demonstration](assets/metaglens-workflow-demo.gif)
 
-*The demonstration loops automatically.*
 
 MetaGLens Skills is a modular Codex skill bundle for designing reproducible
 shotgun-metagenomics workflows from paired raw reads to metagenome-assembled
