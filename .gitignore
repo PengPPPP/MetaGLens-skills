@@ -1,0 +1,21 @@
+# ==== Local-only source assets (kept out of the repo) ====
+# Original Chinese-named brand/demo sources (any suffix, e.g. "(1)"); the repo
+# uses the ASCII copies under assets/ and shared/templates/ instead.
+/MetaGLens-skills*.png
+/MetaGLens-skills*.gif
+
+# ==== Example previews kept local ====
+# Development demo (mock data / "Demo" badge) and the intermediate logo crop
+# used only to build report_logo.b64.
+examples/metaglens_report_demo.html
+examples/metaglens_logo.png
+
+# ==== Run outputs and scratch ====
+metaglens_results/
+.tmp_*/
+*.tmp
+
+# ==== OS / editor cruft ====
+.DS_Store
+Thumbs.db
+.qoder/

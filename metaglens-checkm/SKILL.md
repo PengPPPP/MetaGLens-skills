@@ -19,6 +19,10 @@ Collect or inherit the project name, input-bin directory, bin extension, work
 directory, execution environment, CheckM2 database path, completeness
 threshold, contamination threshold, and thread count.
 
+When run as stage 05 of the `metaglens` workflow, set `BINS_DIR` to the
+collected, renamed bins from stage 04: `04_binning/all_bins/` (files named
+`{label}_bin{N}.fa`). Use `fa` as the bin extension for that directory.
+
 Defaults: minimum completeness 50%, maximum contamination 10%, and 16 threads.
 Do not describe these thresholds as high-quality MIMAG criteria; they are a
 broad downstream-retention threshold.

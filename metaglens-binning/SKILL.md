@@ -16,10 +16,12 @@ independently or as stage 04 of the `metaglens` workflow.
 
 Collect or inherit the project name, contig path, BAM/depth inputs, work
 directory, execution environment, selected binners, DAS Tool choice, minimum
-contig length, assembly strategy, sample list, and thread count.
+contig length, binning strategy, group label, sample list, and the parallel plan
+(total threads, parallel jobs, threads per job).
 
 Defaults: enable MetaBAT2, MaxBin2, CONCOCT, and DAS Tool; use a minimum contig
-length of 1,500 bp and 16 threads.
+length of 1,500 bp. `GROUP_LABEL` (used to prefix renamed bins in co-binning)
+defaults to the project name.
 
 ## Generate the script
 
@@ -36,8 +38,17 @@ Require the script to:
 5. Convert each FASTA bin directory to a contig-to-bin table with
    `Fasta_to_Contig2Bin.sh` before running DAS Tool.
 6. Pass `--write_bins` to DAS Tool and resolve its actual output directory.
-7. Count bins with `find`, avoiding glob failures under `set -o pipefail`.
-8. Record completion or failure.
+7. Bin each unit concurrently (per-sample binning) via the shared `run_parallel`
+   helper, or as a single all-threads job for co-binning. Support scheduler
+   array jobs through `resolve_task_samples`.
+8. After refinement, select the final bin set (DAS Tool consensus, or the first
+   enabled binner when DAS Tool is off), **rename** each bin to
+   `{label}_bin{N}.fa` (label = sample id for per-sample, `GROUP_LABEL` for
+   co-binning), and **collect** all renamed bins into `04_binning/all_bins/`.
+9. Record completion or failure.
+
+`04_binning/all_bins/` is the canonical input for stage 05 (`BINS_DIR`). The
+sample-prefixed names keep every downstream MAG traceable to its source.
 
 Do not pass directories directly to DAS Tool's `-i` option; it expects
 comma-separated contig-to-bin mapping files.

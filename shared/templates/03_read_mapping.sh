@@ -56,17 +56,22 @@ check_prerequisite "02_assembly"
 update_step_status "${STEP_NAME}" "running"
 enable_step_failure_trap
 
+# ===== Parallel plan =====
+# Per-sample mapping supports scheduler array jobs (one task per sample).
+load_parallel_plan
+log "Parallel plan: exec_env=${EXEC_ENV}, jobs=${PARALLEL_JOBS}, threads/job=${THREADS_PER_JOB}, total=${TOTAL_THREADS}"
+
 # ===== Execution =====
 log_step "Starting read mapping"
 log "Align tool: ${ALIGN_TOOL}"
 log "Align mode: ${ALIGN_MODE}"
 log "Calculate depth: ${CALC_DEPTH}"
-log "Threads: ${THREADS}"
 mkdir -p "${OUTPUT_DIR}"
 
 START_TIME=$(date '+%H:%M')
 
 # Resolve contig file locations
+SHARED_INDEX=""
 if [[ "${ASSEMBLY_STRATEGY}" == "co-assembly" ]]; then
     # Co-assembly uses one contig file
     COASSEMBLY_DIR="${ASSEMBLY_DIR}/coassembly"
@@ -75,77 +80,96 @@ if [[ "${ASSEMBLY_STRATEGY}" == "co-assembly" ]]; then
     [[ -f "${CONTIGS_FILE}" ]] || CONTIGS_FILE="${COASSEMBLY_DIR}/contigs.fasta"
     CONTIGS_MODE="shared"
     log "Co-assembly detected — using shared contigs: ${CONTIGS_FILE}"
+    if [[ ! -f "${CONTIGS_FILE}" ]]; then
+        log "ERROR: Shared contigs file not found: ${CONTIGS_FILE}"
+        exit 1
+    fi
+    # Build the shared index once (avoids concurrent index races across samples).
+    if [[ "${ALIGN_TOOL}" == "bowtie2" ]]; then
+        SHARED_INDEX="${OUTPUT_DIR}/coassembly_contigs_idx"
+        log "Building shared Bowtie2 index (threads=${TOTAL_THREADS})..."
+        bowtie2-build --threads "${TOTAL_THREADS}" "${CONTIGS_FILE}" "${SHARED_INDEX}"
+    else
+        log "Building shared bwa-mem2 index..."
+        bwa-mem2 index "${CONTIGS_FILE}"
+        SHARED_INDEX="${CONTIGS_FILE}"
+    fi
 else
     CONTIGS_MODE="per_sample"
 fi
 
-for SAMPLE in "${SAMPLES[@]}"; do
+# Map one sample to its contigs and (optionally) compute contig depth.
+map_sample() {
+    local SAMPLE="$1"
+    local R1="${QC_DIR}/${SAMPLE}_clean_R1.fastq.gz"
+    local R2="${QC_DIR}/${SAMPLE}_clean_R2.fastq.gz"
+    local CONTIGS_FILE_LOCAL INDEX_PREFIX
     log_step "Mapping sample: ${SAMPLE}"
-    R1="${QC_DIR}/${SAMPLE}_clean_R1.fastq.gz"
-    R2="${QC_DIR}/${SAMPLE}_clean_R2.fastq.gz"
 
     if [[ "${CONTIGS_MODE}" == "per_sample" ]]; then
-        # Per-sample assembly uses one contig file per sample
-        CONTIGS_FILE="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs_filtered.fa"
-        [[ -f "${CONTIGS_FILE}" ]] || CONTIGS_FILE="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs.fa"
-        [[ -f "${CONTIGS_FILE}" ]] || CONTIGS_FILE="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
+        CONTIGS_FILE_LOCAL="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs_filtered.fa"
+        [[ -f "${CONTIGS_FILE_LOCAL}" ]] || CONTIGS_FILE_LOCAL="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs.fa"
+        [[ -f "${CONTIGS_FILE_LOCAL}" ]] || CONTIGS_FILE_LOCAL="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
+    else
+        CONTIGS_FILE_LOCAL="${CONTIGS_FILE}"
     fi
 
-    # Store BAM files in sample subdirectories to match the stage 04 contract
-    SAMPLE_DIR="${OUTPUT_DIR}/${SAMPLE}"
-    BAM="${SAMPLE_DIR}/${SAMPLE}.sorted.bam"
+    local SAMPLE_DIR="${OUTPUT_DIR}/${SAMPLE}"
+    local BAM="${SAMPLE_DIR}/${SAMPLE}.sorted.bam"
     mkdir -p "${SAMPLE_DIR}"
 
-    if [[ ! -f "${CONTIGS_FILE}" ]]; then
-        log "ERROR: Contigs file not found: ${CONTIGS_FILE}"
-        exit 1
+    if [[ ! -f "${CONTIGS_FILE_LOCAL}" ]]; then
+        log "ERROR: Contigs file not found: ${CONTIGS_FILE_LOCAL}"
+        return 1
     fi
-    log "  Contigs: ${CONTIGS_FILE}"
+    log "  [${SAMPLE}] Contigs: ${CONTIGS_FILE_LOCAL}"
 
-    # Step 1: Build the index
     if [[ "${ALIGN_TOOL}" == "bowtie2" ]]; then
-        mkdir -p "${SAMPLE_DIR}"
-        INDEX_PREFIX="${SAMPLE_DIR}/${SAMPLE}_contigs_idx"
-        log "  Building Bowtie2 index..."
-        bowtie2-build --threads "${THREADS}" "${CONTIGS_FILE}" "${INDEX_PREFIX}"
-
-        # Step 2: Align reads
-        log "  Running Bowtie2 alignment..."
+        if [[ -n "${SHARED_INDEX}" ]]; then
+            INDEX_PREFIX="${SHARED_INDEX}"
+        else
+            INDEX_PREFIX="${SAMPLE_DIR}/${SAMPLE}_contigs_idx"
+            log "  [${SAMPLE}] Building Bowtie2 index..."
+            bowtie2-build --threads "${THREADS_PER_JOB}" "${CONTIGS_FILE_LOCAL}" "${INDEX_PREFIX}"
+        fi
+        log "  [${SAMPLE}] Running Bowtie2 alignment..."
         bowtie2 --"${ALIGN_MODE}" \
             -x "${INDEX_PREFIX}" \
             -1 "${R1}" -2 "${R2}" \
-            --threads "${THREADS}" \
+            --threads "${THREADS_PER_JOB}" \
             2>"${SAMPLE_DIR}/${SAMPLE}_bowtie2.log" | \
-            samtools sort -@ "${THREADS}" -o "${BAM}"
+            samtools sort -@ "${THREADS_PER_JOB}" -o "${BAM}"
     else
-        # bwa-mem2
-        log "  Running bwa-mem2 alignment..."
-        bwa-mem2 index "${CONTIGS_FILE}"
-        bwa-mem2 mem -t "${THREADS}" "${CONTIGS_FILE}" "${R1}" "${R2}" | \
-            samtools sort -@ "${THREADS}" -o "${BAM}"
+        if [[ -z "${SHARED_INDEX}" ]]; then
+            log "  [${SAMPLE}] Building bwa-mem2 index..."
+            bwa-mem2 index "${CONTIGS_FILE_LOCAL}"
+        fi
+        log "  [${SAMPLE}] Running bwa-mem2 alignment..."
+        bwa-mem2 mem -t "${THREADS_PER_JOB}" "${CONTIGS_FILE_LOCAL}" "${R1}" "${R2}" | \
+            samtools sort -@ "${THREADS_PER_JOB}" -o "${BAM}"
     fi
 
-    # Step 3: Index the BAM file
-    log "  Indexing BAM..."
-    samtools index -@ "${THREADS}" "${BAM}"
+    log "  [${SAMPLE}] Indexing BAM..."
+    samtools index -@ "${THREADS_PER_JOB}" "${BAM}"
 
-    # Step 4: Alignment statistics
+    local TOTAL_READS MAPPED_READS
     TOTAL_READS=$(samtools view -c "${BAM}" 2>/dev/null)
     MAPPED_READS=$(samtools view -c -F 4 "${BAM}" 2>/dev/null)
-    log "  Total reads in BAM: ${TOTAL_READS}"
-    log "  Mapped reads: ${MAPPED_READS}"
+    log "  [${SAMPLE}] Total reads: ${TOTAL_READS}, mapped: ${MAPPED_READS}"
 
-    # Step 5: Optional contig-depth calculation
     if [[ "${CALC_DEPTH}" == "yes" ]]; then
-        log "  Calculating contig depth..."
+        log "  [${SAMPLE}] Calculating contig depth..."
         jgi_summarize_bam_contig_depths \
             --outputDepth "${SAMPLE_DIR}/${SAMPLE}_depth.txt" \
             "${BAM}"
-        log "  Depth file: ${SAMPLE_DIR}/${SAMPLE}_depth.txt"
     fi
+    log "  [${SAMPLE}] mapping completed."
+}
 
-    log "  Sample ${SAMPLE} mapping completed."
-done
+# Restrict to this task's sample under a scheduler array job.
+mapfile -t RUN_SAMPLES < <(resolve_task_samples "${SAMPLES[@]}")
+log "Mapping ${#RUN_SAMPLES[@]} sample(s) with up to ${PARALLEL_JOBS} concurrent job(s)."
+run_parallel "${PARALLEL_JOBS}" map_sample "${RUN_SAMPLES[@]}"
 
 # For a co-assembly, create one shared depth table from all sample BAM files.
 if [[ "${ASSEMBLY_STRATEGY}" == "co-assembly" && "${CALC_DEPTH}" == "yes" ]]; then

@@ -197,50 +197,13 @@ if [[ -f "${RUN_LOG}" ]]; then
 - **Output**: ${OUTPUT_DIR}/
 - **Detailed log**: logs/08_annotation.log
 
----
-
-## Pipeline complete 🎉
-
-**All stages completed.** See the stage summaries above for final results.
-
-### Output layout
-\`\`\`
-${RESULTS_DIR}/
-├── 00_setup.sh
-├── 01_qc/              # quality-controlled reads
-├── 02_assembly/         # Assembly contigs
-├── 03_mapping/          # mapped BAM and depth
-├── 04_binning/          # Binning bins
-├── 05_checkm/           # quality assessment and filtering
-├── 06_derep/            # dereplicated representative genomes
-├── 07_taxonomy/         # taxonomic classifications
-├── 08_annotation/       # functional annotations
-├── reports/             # reports
-│   ├── logs/            # stage logs
-│   ├── run_log.md       # run log
-│   ├── tool_versions.txt
-│   └── conda_env_packages.tsv
-├── pipeline_status.json
-└── pipeline_utils.sh
-\`\`\`
-
-### Complete Methods section
-
-*(The AI assembles stage-specific Methods text during the session.)*
-
-### References
-
-See \`shared/references.md\` for citations to all tools used.
-
 EOFRUNLOGANN
 fi
 
 log_step "Functional annotation completed"
 echo ""
-echo "============================================"
-echo " MetaGLens Pipeline — All Steps Complete!  "
-echo "============================================"
-echo ""
+echo "MAG functional annotation complete."
+echo "Depending on the route, next run: bash 10_community_summary.sh (then 11_delivery.sh)."
 echo "View full run log: cat ${RUN_LOG}"
 echo "Check tool versions: cat ${REPORTS_DIR}/tool_versions.txt"
 echo ""

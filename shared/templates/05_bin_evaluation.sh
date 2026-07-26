@@ -17,6 +17,8 @@ source "${SCRIPT_DIR}/pipeline_utils.sh"
 # ===== Parameters =====
 STEP_NAME="05_checkm"
 WORK_DIR="{{WORK_DIR}}"
+# BINS_DIR should point to the collected, renamed bins from stage 04:
+#   {WORK_DIR}/metaglens_results/04_binning/all_bins  (files named {label}_bin{N}.fa)
 BINS_DIR="{{BINS_DIR}}"
 BIN_EXTENSION="{{BIN_EXTENSION}}"
 CONDA_ENV="{{CONDA_ENV}}"

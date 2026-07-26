@@ -103,7 +103,7 @@ check_step_completed() {
     local step="$1"
     if [[ -f "${STATUS_FILE}" ]]; then
         local status
-        status=$(python3 -c "import json;f=open('${STATUS_FILE}');d=json.load(f);print(d['steps']['${step}']['status'])")
+        status=$(python3 -c "import json;d=json.load(open('${STATUS_FILE}'));print(d['steps'].get('${step}',{}).get('status','pending'))")
         if [[ "$status" == "completed" ]]; then
             log "Step ${step} already completed — skipping."
             return 1
@@ -112,18 +112,35 @@ check_step_completed() {
     return 0
 }
 
-check_prerequisite() {
+# Return 0 when a step is part of the selected route, 1 otherwise.
+# Steps outside the route are provided by the user directly, so their
+# prerequisites are not enforced.
+step_in_route() {
     local step="$1"
     if [[ -f "${STATUS_FILE}" ]]; then
-        local status
-        status=$(python3 -c "import json;f=open('${STATUS_FILE}');d=json.load(f);print(d['steps']['${step}']['status'])")
-        if [[ "$status" != "completed" ]]; then
-            log "ERROR: Prerequisite step '${step}' not completed (status: ${status})."
-            log "       Please run ${step}.sh first."
-            exit 1
-        fi
-    else
+        python3 -c "import json,sys;d=json.load(open('${STATUS_FILE}'));sys.exit(0 if '${step}' in d.get('selected_steps',[]) else 1)"
+        return $?
+    fi
+    # No status file yet: assume the step is in scope so callers fail loudly.
+    return 0
+}
+
+check_prerequisite() {
+    local step="$1"
+    if [[ ! -f "${STATUS_FILE}" ]]; then
         log "ERROR: pipeline_status.json not found. Run 00_setup.sh first."
+        exit 1
+    fi
+    # Route-aware: only enforce prerequisites that belong to the selected route.
+    if ! step_in_route "${step}"; then
+        log "Prerequisite '${step}' is not part of this route — skipping prerequisite check."
+        return 0
+    fi
+    local status
+    status=$(python3 -c "import json;d=json.load(open('${STATUS_FILE}'));print(d['steps'].get('${step}',{}).get('status','pending'))")
+    if [[ "$status" != "completed" ]]; then
+        log "ERROR: Prerequisite step '${step}' not completed (status: ${status})."
+        log "       Please run ${step}.sh first."
         exit 1
     fi
 }
@@ -142,3 +159,84 @@ append_run_log_section() {
     local content="$1"
     echo "${content}" >> "${RUN_LOG}"
 }
+
+# === Parallel execution helpers ===
+# Load the parallel plan recorded by 00_setup.sh into shell globals:
+#   EXEC_ENV, TOTAL_THREADS, PARALLEL_JOBS, THREADS_PER_JOB
+# Falls back to safe single-job defaults when the file or fields are absent.
+load_parallel_plan() {
+    if [[ -f "${STATUS_FILE}" ]]; then
+        eval "$(python3 -c "
+import json
+d=json.load(open('${STATUS_FILE}'))
+p=d.get('parallel',{})
+print('EXEC_ENV=%s' % (p.get('exec_env','local')))
+print('TOTAL_THREADS=%d' % int(p.get('total_threads', ${THREADS:-1})))
+print('PARALLEL_JOBS=%d' % max(1, int(p.get('parallel_jobs', 1))))
+print('THREADS_PER_JOB=%d' % max(1, int(p.get('threads_per_job', ${THREADS:-1}))))
+")"
+    else
+        EXEC_ENV="${EXEC_ENV:-local}"
+        TOTAL_THREADS="${TOTAL_THREADS:-${THREADS:-1}}"
+        PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
+        THREADS_PER_JOB="${THREADS_PER_JOB:-${THREADS:-1}}"
+    fi
+}
+
+# Return the 1-based task index when running as a scheduler array job, else "".
+current_task_index() {
+    if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        echo "${SLURM_ARRAY_TASK_ID}"
+    elif [[ -n "${SGE_TASK_ID:-}" && "${SGE_TASK_ID}" != "undefined" ]]; then
+        echo "${SGE_TASK_ID}"
+    else
+        echo ""
+    fi
+}
+
+# Echo the samples this invocation should process.
+# Under a scheduler array job, restrict to the single indexed sample.
+# Usage: mapfile -t RUN_SAMPLES < <(resolve_task_samples "${SAMPLES[@]}")
+resolve_task_samples() {
+    local all=("$@")
+    local idx
+    idx="$(current_task_index)"
+    if [[ -n "${idx}" ]]; then
+        local pos=$((idx - 1))
+        if (( pos < 0 || pos >= ${#all[@]} )); then
+            log "ERROR: array task index ${idx} is out of range (samples: ${#all[@]})."
+            exit 1
+        fi
+        printf '%s\n' "${all[$pos]}"
+    else
+        printf '%s\n' "${all[@]}"
+    fi
+}
+
+# Run a function over items with bounded concurrency (batched pool).
+# Usage: run_parallel <max_jobs> <func_name> item1 [item2 ...]
+# The function receives one item as $1. Returns nonzero if any invocation fails.
+run_parallel() {
+    local max_jobs="$1"; shift
+    local func="$1"; shift
+    (( max_jobs < 1 )) && max_jobs=1
+    local rc=0
+    local -a batch_pids=()
+    local count=0 pid item
+    for item in "$@"; do
+        "${func}" "${item}" &
+        batch_pids+=("$!")
+        count=$((count + 1))
+        if (( count % max_jobs == 0 )); then
+            for pid in "${batch_pids[@]}"; do
+                wait "${pid}" || rc=$?
+            done
+            batch_pids=()
+        fi
+    done
+    for pid in "${batch_pids[@]}"; do
+        wait "${pid}" || rc=$?
+    done
+    return "${rc}"
+}
+

@@ -21,6 +21,21 @@ THREADS={{THREADS}}
 DB_DIR="{{DB_DIR}}"
 DOWNLOAD_DBS="{{DOWNLOAD_DBS}}"
 
+# ===== Route and execution plan =====
+# ROUTE_NAME: mag_per_sample | mag_co_binning | contig_based | mag_and_contig | custom
+# ANALYSIS_BASIS: mag | contig | both
+# BINNING_STRATEGY: per_sample | co_binning | none
+# SELECTED_STEPS: ordered list of step ids that this run will execute
+# EXEC_ENV: local | slurm | sge
+ROUTE_NAME="{{ROUTE_NAME}}"
+ANALYSIS_BASIS="{{ANALYSIS_BASIS}}"
+BINNING_STRATEGY="{{BINNING_STRATEGY}}"
+SELECTED_STEPS=({{SELECTED_STEPS}})
+EXEC_ENV="{{EXEC_ENV}}"
+TOTAL_THREADS={{TOTAL_THREADS}}
+PARALLEL_JOBS={{PARALLEL_JOBS}}
+THREADS_PER_JOB={{THREADS_PER_JOB}}
+
 STEP_NAME="00_setup"
 
 # ===== Paths =====
@@ -34,7 +49,7 @@ REPAIR_LOG="${REPORTS_DIR}/repair_log.jsonl"
 REPAIRS_DIR="${REPORTS_DIR}/repairs"
 
 # ===== Directory layout (create first because log depends on LOG_DIR)=====
-mkdir -p "${RESULTS_DIR}"/{01_qc,02_assembly,03_mapping,04_binning,05_checkm,06_derep,07_taxonomy,08_annotation}
+mkdir -p "${RESULTS_DIR}"/{01_qc,02_assembly,03_mapping,04_binning,05_checkm,06_derep,07_taxonomy,08_annotation,09_contig,10_community,delivery}
 mkdir -p "${LOG_DIR}" "${REPAIRS_DIR}"
 touch "${REPAIR_LOG}"
 
@@ -80,43 +95,83 @@ fi
 
 # ===== Status-file functions =====
 init_status_file() {
-    # Build the samples JSON array in Bash without jq
-    local samples_json
-    samples_json=$(for s in "${SAMPLE_LIST[@]}"; do printf '"%s",' "$s"; done)
-    samples_json="[${samples_json%,}]"
+    # Build the dynamic status file from the selected route step list.
+    # 00_setup starts as running; every other selected step starts as pending.
+    METAGLENS_STATUS_FILE="${STATUS_FILE}" \
+    METAGLENS_PROJECT_NAME="${PROJECT_NAME}" \
+    METAGLENS_WORK_DIR="${WORK_DIR}" \
+    METAGLENS_RESULTS_DIR="${RESULTS_DIR}" \
+    METAGLENS_REPORTS_DIR="${REPORTS_DIR}" \
+    METAGLENS_SAMPLE_MANIFEST="${SAMPLE_MANIFEST}" \
+    METAGLENS_SAMPLE_PATTERN="${SAMPLE_PATTERN}" \
+    METAGLENS_CONDA_MODE="${CONDA_MODE}" \
+    METAGLENS_CONDA_ENV="${CONDA_ENV}" \
+    METAGLENS_CONDA_ORIGIN="${CONDA_ORIGIN}" \
+    METAGLENS_ENV_QC="${ENV_QC}" \
+    METAGLENS_ENV_BINNING="${ENV_BINNING}" \
+    METAGLENS_ENV_MAG="${ENV_MAG}" \
+    METAGLENS_ROUTE_NAME="${ROUTE_NAME}" \
+    METAGLENS_ANALYSIS_BASIS="${ANALYSIS_BASIS}" \
+    METAGLENS_BINNING_STRATEGY="${BINNING_STRATEGY}" \
+    METAGLENS_EXEC_ENV="${EXEC_ENV}" \
+    METAGLENS_TOTAL_THREADS="${TOTAL_THREADS}" \
+    METAGLENS_PARALLEL_JOBS="${PARALLEL_JOBS}" \
+    METAGLENS_THREADS_PER_JOB="${THREADS_PER_JOB}" \
+    METAGLENS_SELECTED_STEPS="${SELECTED_STEPS[*]}" \
+    METAGLENS_SAMPLES="${SAMPLE_LIST[*]}" \
+    python3 - <<'PY'
+import datetime
+import json
+import os
 
-    cat > "${STATUS_FILE}" << EOFSTATUS
-{
-  "project_name": "${PROJECT_NAME}",
-  "work_dir": "${WORK_DIR}",
-  "results_dir": "${RESULTS_DIR}",
-  "reports_dir": "${REPORTS_DIR}",
-  "sample_manifest": "${SAMPLE_MANIFEST}",
-  "created_at": "$(date '+%Y-%m-%d %H:%M:%S')",
-  "monitoring": {
-    "enabled": true,
-    "max_auto_repair_attempts": 2
-  },
-  "steps": {
-    "00_setup": {"status": "running", "started": "$(date '+%Y-%m-%d %H:%M:%S')", "attempts": 1},
-    "01_qc": {"status": "pending", "attempts": 0},
-    "02_assembly": {"status": "pending", "attempts": 0},
-    "03_mapping": {"status": "pending", "attempts": 0},
-    "04_binning": {"status": "pending", "attempts": 0},
-    "05_checkm": {"status": "pending", "attempts": 0},
-    "06_derep": {"status": "pending", "attempts": 0},
-    "07_taxonomy": {"status": "pending", "attempts": 0},
-    "08_annotation": {"status": "pending", "attempts": 0}
-  },
-  "samples": ${samples_json},
-  "sample_pattern": "${SAMPLE_PATTERN}",
-  "conda_mode": "${CONDA_MODE}",
-  "conda_env": "${CONDA_ENV}",
-  "conda_envs": {"qc": "${ENV_QC}", "binning": "${ENV_BINNING}", "mag": "${ENV_MAG}"},
-  "conda_origin": "${CONDA_ORIGIN}",
-  "collected_methods": []
+now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+selected = os.environ["METAGLENS_SELECTED_STEPS"].split()
+if "00_setup" not in selected:
+    selected = ["00_setup"] + selected
+samples = os.environ["METAGLENS_SAMPLES"].split()
+
+steps = {}
+for step in selected:
+    if step == "00_setup":
+        steps[step] = {"status": "running", "started": now, "attempts": 1}
+    else:
+        steps[step] = {"status": "pending", "attempts": 0}
+
+data = {
+    "project_name": os.environ["METAGLENS_PROJECT_NAME"],
+    "work_dir": os.environ["METAGLENS_WORK_DIR"],
+    "results_dir": os.environ["METAGLENS_RESULTS_DIR"],
+    "reports_dir": os.environ["METAGLENS_REPORTS_DIR"],
+    "sample_manifest": os.environ["METAGLENS_SAMPLE_MANIFEST"],
+    "created_at": now,
+    "route_name": os.environ["METAGLENS_ROUTE_NAME"],
+    "analysis_basis": os.environ["METAGLENS_ANALYSIS_BASIS"],
+    "binning_strategy": os.environ["METAGLENS_BINNING_STRATEGY"],
+    "selected_steps": selected,
+    "parallel": {
+        "exec_env": os.environ["METAGLENS_EXEC_ENV"],
+        "total_threads": int(os.environ["METAGLENS_TOTAL_THREADS"]),
+        "parallel_jobs": int(os.environ["METAGLENS_PARALLEL_JOBS"]),
+        "threads_per_job": int(os.environ["METAGLENS_THREADS_PER_JOB"]),
+    },
+    "monitoring": {"enabled": True, "max_auto_repair_attempts": 2},
+    "steps": steps,
+    "samples": samples,
+    "sample_pattern": os.environ["METAGLENS_SAMPLE_PATTERN"],
+    "conda_mode": os.environ["METAGLENS_CONDA_MODE"],
+    "conda_env": os.environ["METAGLENS_CONDA_ENV"],
+    "conda_envs": {
+        "qc": os.environ["METAGLENS_ENV_QC"],
+        "binning": os.environ["METAGLENS_ENV_BINNING"],
+        "mag": os.environ["METAGLENS_ENV_MAG"],
+    },
+    "conda_origin": os.environ["METAGLENS_CONDA_ORIGIN"],
+    "collected_methods": [],
 }
-EOFSTATUS
+
+with open(os.environ["METAGLENS_STATUS_FILE"], "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2, ensure_ascii=False)
+PY
 }
 
 update_step_status() {
@@ -325,25 +380,56 @@ cat >> "${RUN_LOG}" << EOFRUNLOG2
 
 **Total: ${#SAMPLE_LIST[@]} paired-end samples; naming pattern: ${SAMPLE_PATTERN}**
 
+## Route and execution plan
+
+| Property | Value |
+|------|----|
+| Route | ${ROUTE_NAME} |
+| Analysis basis | ${ANALYSIS_BASIS} |
+| Binning strategy | ${BINNING_STRATEGY} |
+| Execution environment | ${EXEC_ENV} |
+| Total threads | ${TOTAL_THREADS} |
+| Parallel jobs x threads/job | ${PARALLEL_JOBS} x ${THREADS_PER_JOB} |
+| Selected steps | ${SELECTED_STEPS[*]} |
+
 ## Pipeline progress
 
 | Stage | Status | Started | Finished | Script |
 |------|------|----------|----------|------|
-| 00_setup | 🔄 Running | $(date '+%H:%M') | - | 00_setup.sh |
-| 01_qc | ⏳ Pending | - | - | 01_quality_control.sh |
-| 02_assembly | ⏳ Pending | - | - | 02_assembly.sh |
-| 03_mapping | ⏳ Pending | - | - | 03_read_mapping.sh |
-| 04_binning | ⏳ Pending | - | - | 04_binning.sh |
-| 05_checkm | ⏳ Pending | - | - | 05_bin_evaluation.sh |
-| 06_derep | ⏳ Pending | - | - | 06_dereplication.sh |
-| 07_taxonomy | ⏳ Pending | - | - | 07_taxonomy.sh |
-| 08_annotation | ⏳ Pending | - | - | 08_annotation.sh |
+EOFRUNLOG2
+
+# Map each step id to its script file and write one progress row per selected step.
+declare -A STEP_SCRIPTS=(
+    [00_setup]="00_setup.sh"
+    [01_qc]="01_quality_control.sh"
+    [02_assembly]="02_assembly.sh"
+    [03_mapping]="03_read_mapping.sh"
+    [04_binning]="04_binning.sh"
+    [05_checkm]="05_bin_evaluation.sh"
+    [06_derep]="06_dereplication.sh"
+    [07_taxonomy]="07_taxonomy.sh"
+    [08_annotation]="08_annotation.sh"
+    [mag_abundance]="mag_abundance.sh"
+    [09_contig]="09_contig_analysis.sh"
+    [10_community]="10_community_summary.sh"
+    [11_delivery]="11_delivery.sh"
+)
+for STEP in "${SELECTED_STEPS[@]}"; do
+    SCRIPT_NAME="${STEP_SCRIPTS[$STEP]:-${STEP}.sh}"
+    if [[ "${STEP}" == "00_setup" ]]; then
+        echo "| 00_setup | 🔄 Running | $(date '+%H:%M') | - | ${SCRIPT_NAME} |" >> "${RUN_LOG}"
+    else
+        echo "| ${STEP} | ⏳ Pending | - | - | ${SCRIPT_NAME} |" >> "${RUN_LOG}"
+    fi
+done
+
+cat >> "${RUN_LOG}" << 'EOFRUNLOG3'
 
 ## Stage summaries
 
 *(Updated automatically after each stage completes)*
 
-EOFRUNLOG2
+EOFRUNLOG3
 
 # Step 3: Conda environment setup
 log "========================================"
@@ -570,8 +656,22 @@ sed -i "s/| 00_setup |[^|]*|[^|]*|[^|]*|/| 00_setup | ✅ Completion | - | $(dat
 
 log "======== MetaGLens Setup Complete ========"
 log "All results in: ${RESULTS_DIR}/"
+
+# Determine the first non-setup step of this route for the next-step hint.
+NEXT_STEP=""
+for STEP in "${SELECTED_STEPS[@]}"; do
+    [[ "${STEP}" == "00_setup" ]] && continue
+    NEXT_STEP="${STEP}"
+    break
+done
+NEXT_SCRIPT="${STEP_SCRIPTS[$NEXT_STEP]:-}"
+
 echo ""
 echo "Next steps:"
 echo "  1. cd ${RESULTS_DIR}"
-echo "  2. bash 01_quality_control.sh   (the script activates the required Conda environment)"
+if [[ -n "${NEXT_SCRIPT}" ]]; then
+    echo "  2. bash ${NEXT_SCRIPT}   (the script activates the required Conda environment)"
+else
+    echo "  2. Run the stage scripts for this route in order: ${SELECTED_STEPS[*]}"
+fi
 echo "  3. View run log: cat ${RUN_LOG}"

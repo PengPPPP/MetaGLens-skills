@@ -56,13 +56,18 @@ check_prerequisite "01_qc"
 update_step_status "${STEP_NAME}" "running"
 enable_step_failure_trap
 
+# ===== Parallel plan =====
+# Per-sample assembly supports scheduler array jobs (one task per sample);
+# co-assembly is a single job that uses all available threads.
+load_parallel_plan
+log "Parallel plan: exec_env=${EXEC_ENV}, jobs=${PARALLEL_JOBS}, threads/job=${THREADS_PER_JOB}, total=${TOTAL_THREADS}"
+
 # ===== Execution =====
 log_step "Starting assembly"
 log "Assembler: ${ASSEMBLER}"
 log "Strategy: ${ASSEMBLY_STRATEGY}"
 log "K-mer list: ${KMER_LIST}"
 log "Min contig length: ${MIN_CONTIG_LEN} bp"
-log "Threads: ${THREADS}"
 mkdir -p "${OUTPUT_DIR}"
 
 START_TIME=$(date '+%H:%M')
@@ -84,13 +89,13 @@ if [[ "${ASSEMBLY_STRATEGY}" == "co-assembly" ]]; then
             --min-contig-len "${MIN_CONTIG_LEN}" \
             --presets "${MEGAHIT_PRESET}" \
             --force \
-            -t "${THREADS}"
+            -t "${TOTAL_THREADS}"
     else
         log "Running metaSPAdes..."
         metaspades.py -1 "${R1_LIST}" -2 "${R2_LIST}" \
             -o "${OUTPUT_DIR}/${SAMPLE_NAME}" \
             -k "${KMER_LIST}" \
-            --threads "${THREADS}"
+            --threads "${TOTAL_THREADS}"
     fi
 
     # Filter and summarize contigs; use final.contigs_filtered.fa as the canonical output
@@ -105,11 +110,13 @@ if [[ "${ASSEMBLY_STRATEGY}" == "co-assembly" ]]; then
     fi
 
 else
-    # Per-sample assembly
-    for SAMPLE in "${SAMPLES[@]}"; do
+    # Per-sample assembly (parallelized across samples)
+    assemble_sample() {
+        local SAMPLE="$1"
+        local R1="${QC_DIR}/${SAMPLE}_clean_R1.fastq.gz"
+        local R2="${QC_DIR}/${SAMPLE}_clean_R2.fastq.gz"
+        local CONTIGS_FILE
         log_step "Assembling sample: ${SAMPLE}"
-        R1="${QC_DIR}/${SAMPLE}_clean_R1.fastq.gz"
-        R2="${QC_DIR}/${SAMPLE}_clean_R2.fastq.gz"
 
         if [[ "${ASSEMBLER}" == "megahit" ]]; then
             megahit -1 "${R1}" -2 "${R2}" \
@@ -118,13 +125,13 @@ else
                 --min-contig-len "${MIN_CONTIG_LEN}" \
                 --presets "${MEGAHIT_PRESET}" \
                 --force \
-                -t "${THREADS}"
+                -t "${THREADS_PER_JOB}"
             CONTIGS_FILE="${OUTPUT_DIR}/${SAMPLE}/final.contigs.fa"
         else
             metaspades.py -1 "${R1}" -2 "${R2}" \
                 -o "${OUTPUT_DIR}/${SAMPLE}" \
                 -k "${KMER_LIST}" \
-                --threads "${THREADS}"
+                --threads "${THREADS_PER_JOB}"
             CONTIGS_FILE="${OUTPUT_DIR}/${SAMPLE}/contigs.fasta"
         fi
 
@@ -132,10 +139,15 @@ else
         if [[ -f "${CONTIGS_FILE}" ]]; then
             seqkit seq -m "${MIN_CONTIG_LEN}" "${CONTIGS_FILE}" \
                 -o "${OUTPUT_DIR}/${SAMPLE}/final.contigs_filtered.fa"
-            log "  Contig stats for ${SAMPLE}:"
+            log "  [${SAMPLE}] Contig stats:"
             seqkit stats -T "${OUTPUT_DIR}/${SAMPLE}/final.contigs_filtered.fa"
         fi
-    done
+    }
+
+    # Restrict to this task's sample under a scheduler array job.
+    mapfile -t RUN_SAMPLES < <(resolve_task_samples "${SAMPLES[@]}")
+    log "Assembling ${#RUN_SAMPLES[@]} sample(s) with up to ${PARALLEL_JOBS} concurrent job(s)."
+    run_parallel "${PARALLEL_JOBS}" assemble_sample "${RUN_SAMPLES[@]}"
 fi
 
 # ===== Update status and run log =====

@@ -18,23 +18,73 @@ expensive analyses or download databases without explicit user authorization.
 
 ## Delegate stages
 
-Use the corresponding child skill for each analytical stage:
+Use the corresponding child skill for each analytical stage. Not every run
+executes every stage: the stages that run are determined by the selected route
+(see "Choose scope and route" below).
 
 | Stage | Task | Child skill | Script |
 |---|---|---|---|
-| 00 | Project, environment, samples, databases | this skill | `00_setup.sh` |
+| 00 | Project, environment, samples, databases, route, parallel plan | this skill | `00_setup.sh` |
 | 01 | Read quality control | `metaglens-qc` | `01_quality_control.sh` |
 | 02 | Assembly | `metaglens-assembly` | `02_assembly.sh` |
 | 03 | Read mapping and depth | `metaglens-mapping` | `03_read_mapping.sh` |
-| 04 | Genome binning | `metaglens-binning` | `04_binning.sh` |
+| 04 | Genome binning (rename + collect) | `metaglens-binning` | `04_binning.sh` |
 | 05 | MAG quality assessment | `metaglens-checkm` | `05_bin_evaluation.sh` |
 | 06 | Dereplication | `metaglens-derep` | `06_dereplication.sh` |
 | 07 | Taxonomy | `metaglens-taxonomy` | `07_taxonomy.sh` |
-| 08 | Functional annotation | `metaglens-annotation` | `08_annotation.sh` |
+| 08 | Functional annotation (MAGs) | `metaglens-annotation` | `08_annotation.sh` |
+| — | MAG abundance (reads → dereplicated MAGs) | this skill | `mag_abundance.sh` |
+| 09 | Contig-based gene prediction + annotation + taxonomy + abundance | `metaglens-annotation` | `09_contig_analysis.sh` |
+| 10 | Community summary tables (topN) | this skill | `10_community_summary.sh` |
+| 11 | Delivery package + data dictionary | this skill | `11_delivery.sh` |
 
 Pass the project configuration, sample manifest, selected environment, and
 upstream output paths to each child skill. Do not ask for the same value twice
 unless validation detects a conflict.
+
+## Choose scope and route
+
+Before collecting project settings, resolve what this run will do. Record the
+outcome as `route_name`, `analysis_basis`, `binning_strategy`, and the ordered
+`selected_steps` list, and pass them to `00_setup.sh`.
+
+### Step A: scope
+
+Ask whether the user wants to run:
+
+- **the whole pipeline** — proceed to Step B to pick a route; or
+- **only a specific step or steps** — set `route_name=custom`, ask which steps,
+  and build `selected_steps` from that subset (always include `00_setup`).
+
+### Step B: route (only when running the whole pipeline)
+
+Offer the preset routes plus a custom option:
+
+| Route | `analysis_basis` | `binning_strategy` | Steps (after `00_setup`) |
+|---|---|---|---|
+| `mag_per_sample` | mag | per_sample | 01_qc, 02_assembly, 03_mapping, 04_binning, 05_checkm, 06_derep, 07_taxonomy, mag_abundance, 08_annotation, 10_community, 11_delivery |
+| `mag_co_binning` | mag | co_binning | 01_qc, 02_assembly, 03_mapping, 04_binning, 05_checkm, 06_derep, 07_taxonomy, mag_abundance, 08_annotation, 10_community, 11_delivery |
+| `contig_based` | contig | none | 01_qc, 02_assembly, 03_mapping, 09_contig, 10_community, 11_delivery |
+| `mag_and_contig` | both | per_sample or co_binning | 01_qc, 02_assembly, 03_mapping, 04_binning, 05_checkm, 06_derep, 07_taxonomy, mag_abundance, 08_annotation, 09_contig, 10_community, 11_delivery |
+| `custom` | as needed | as needed | user-selected subset |
+
+`mag_per_sample` and `mag_co_binning` differ only by `binning_strategy`, which
+maps to the assembly strategy (`per_sample` → per-sample assembly; `co_binning`
+→ co-assembly with multi-sample depth). For `mag_and_contig`, still ask the
+binning strategy for the MAG branch.
+
+### Step C: analysis basis and binning strategy
+
+When the route does not already fix these, ask explicitly:
+
+1. `analysis_basis`: `mag`, `contig`, or `both`.
+2. If `analysis_basis` includes `mag`: `binning_strategy` = `per_sample`
+   (逐个分箱) or `co_binning` (联合分箱).
+
+For `custom` routes, derive `analysis_basis`/`binning_strategy` from the chosen
+steps and compose the run from the existing stage scripts, honoring each stage's
+prerequisites.
+
 
 ## Phase 0: initialize the project
 
@@ -49,13 +99,32 @@ Collect:
 | Work directory | `./{project_name}` |
 | Database directory | `{work_directory}/databases` |
 | Execution environment | `local` |
-| Threads | `16` |
+| Total available threads | `16` |
+| Parallel jobs x threads/job | derived (see Phase 0 parallel plan) |
 | Memory | environment-dependent |
 | Download databases automatically | `no` |
 
 Accept `local`, `SLURM`, or `SGE`. Explain that the complete database set can
 exceed 200 GB and take hours to prepare. Require explicit approval before
 setting `DOWNLOAD_DBS=yes`.
+
+### Step 0-1b: plan parallelism
+
+Ask for the **total available threads** (`TOTAL_THREADS`). Combine this with the
+sample count to propose a parallel plan for per-sample stages:
+
+- `parallel_jobs` = number of samples processed concurrently.
+- `threads_per_job` = `TOTAL_THREADS / parallel_jobs` (at least 1).
+- Choose `parallel_jobs` so that `parallel_jobs * threads_per_job <= TOTAL_THREADS`.
+  A common default is `parallel_jobs = min(sample_count, TOTAL_THREADS)` with the
+  remaining threads distributed per job; present options and let the user pick.
+
+For `local`, per-sample stages run concurrently via the shared `run_parallel`
+helper. For `SLURM`/`SGE`, per-sample stages emit array jobs (one task per
+sample) and `threads_per_job` becomes the per-task CPU request. Cross-sample
+stages (co-assembly, CheckM2, dRep, GTDB-Tk) run as a single job using all
+threads. Record `exec_env`, `total_threads`, `parallel_jobs`, and
+`threads_per_job` in `pipeline_status.json.parallel`.
 
 ### Step 0-2: inspect software environments
 
@@ -127,6 +196,9 @@ metaglens_results/
 ├── 06_derep/
 ├── 07_taxonomy/
 ├── 08_annotation/
+├── 09_contig/
+├── 10_community/
+├── delivery/
 ├── reports/
 │   ├── logs/
 │   ├── run_log.md
@@ -141,13 +213,23 @@ metaglens_results/
 └── pipeline_utils.sh
 ```
 
+Stage directories not used by the selected route stay empty. Create the full
+set for a consistent layout.
+
 Copy `shared/templates/_pipeline_utils.sh` to the results root as
 `pipeline_utils.sh`. Every stage script must source this file and fail clearly
 if it is missing.
 
+Also copy `shared/templates/report_logo.b64` to the results root as
+`report_logo.b64`. Stage 11 embeds it into `delivery/report.html` so the report
+stays a self-contained single file; if it is missing the report still renders
+with a text title.
+
 ## State and resume contract
 
-Use `pipeline_status.json` as the authoritative state file:
+Use `pipeline_status.json` as the authoritative state file. Its `steps` object
+is **built dynamically from `selected_steps`** for the chosen route, not fixed
+at eight stages:
 
 ```json
 {
@@ -155,6 +237,16 @@ Use `pipeline_status.json` as the authoritative state file:
   "work_dir": "{work_dir}",
   "results_dir": "{work_dir}/metaglens_results",
   "sample_manifest": "{work_dir}/metaglens_results/samples.tsv",
+  "route_name": "mag_per_sample|mag_co_binning|contig_based|mag_and_contig|custom",
+  "analysis_basis": "mag|contig|both",
+  "binning_strategy": "per_sample|co_binning|none",
+  "selected_steps": ["00_setup", "01_qc", "02_assembly", "..."],
+  "parallel": {
+    "exec_env": "local|slurm|sge",
+    "total_threads": 16,
+    "parallel_jobs": 4,
+    "threads_per_job": 4
+  },
   "conda_mode": "create|reuse|reuse_and_update|none",
   "conda_envs": {
     "qc": "{environment}",
@@ -167,23 +259,19 @@ Use `pipeline_status.json` as the authoritative state file:
   },
   "steps": {
     "00_setup": {"status": "completed", "attempts": 1},
-    "01_qc": {"status": "pending", "attempts": 0},
-    "02_assembly": {"status": "pending", "attempts": 0},
-    "03_mapping": {"status": "pending", "attempts": 0},
-    "04_binning": {"status": "pending", "attempts": 0},
-    "05_checkm": {"status": "pending", "attempts": 0},
-    "06_derep": {"status": "pending", "attempts": 0},
-    "07_taxonomy": {"status": "pending", "attempts": 0},
-    "08_annotation": {"status": "pending", "attempts": 0}
+    "01_qc": {"status": "pending", "attempts": 0}
   }
 }
 ```
 
-Use only `pending`, `running`, `completed`, and `failed`.
+Only steps listed in `selected_steps` appear in `steps`. Use only `pending`,
+`running`, `completed`, and `failed`.
 
 Require every stage script to:
 
-1. Validate the status file and prerequisite stage.
+1. Validate the status file and its prerequisite stage. Prerequisite checks are
+   route-aware: a prerequisite that is not in `selected_steps` is skipped
+   (its inputs are assumed to be user-provided).
 2. Exit successfully when the current stage is already completed.
 3. Set the current stage to `running` immediately before execution.
 4. Install an error trap that sets the stage to `failed`.
@@ -193,7 +281,7 @@ Require every stage script to:
 7. Append an English summary to `reports/run_log.md`.
 
 At the start of a later conversation, inspect this file and resume from the
-first non-completed stage.
+first non-completed step in `selected_steps`.
 
 ## Stage-by-stage workflow
 
@@ -211,6 +299,37 @@ For each stage:
 10. Advance only after confirmation.
 
 Scripts must remain runnable after the AI session ends.
+
+## Parallel execution
+
+`shared/templates/_pipeline_utils.sh` provides `load_parallel_plan`,
+`run_parallel`, `resolve_task_samples`, and `current_task_index`. Per-sample
+stages (01 QC, per-sample 02 assembly, 03 mapping, per-sample 04 binning, 09
+contig gene prediction/taxonomy) process samples concurrently up to
+`parallel_jobs`, each using `threads_per_job`. Cross-sample stages (co-assembly,
+CheckM2, dRep, GTDB-Tk, combined eggNOG-mapper) run as a single job with all
+threads. For `SLURM`/`SGE`, submit per-sample stages as array jobs
+(`--array=1-N` / `-t 1-N`); `resolve_task_samples` restricts each task to its
+sample.
+
+## Community summary and delivery
+
+- **Stage 10 (`10_community_summary.sh`)** builds a cross-sample community table
+  and topN subsets. The abundance source is chosen automatically from available
+  outputs, in priority order: Kraken2/Bracken relative abundance (read/contig
+  routes); MAG relative abundance from `mag_abundance.sh` aggregated by GTDB-Tk
+  taxonomy (MAG route with the abundance step); GTDB-Tk representative-genome
+  counts (MAG route fallback); or Kraken2 report composition. The chosen source
+  is written to `10_community/SOURCE.txt`. Collect the topN cut-offs
+  (default `10 15`) and the Bracken level (default `S`).
+- **Stage 11 (`11_delivery.sh`)** assembles analysis-ready outputs into
+  `delivery/` (genomes, tables, annotations, taxonomy, contig outputs, community
+  tables), generates `delivery/DATA_DICTIONARY.md` describing every file, and
+  builds `delivery/report.html`: a self-contained interactive report (light
+  poster theme, embedded logo, Times New Roman) populated from the real
+  delivered tables and headed with the project, route, and raw-data folder.
+  Tarball creation is optional (`DO_TARBALL=yes`) and requires user
+  confirmation. Pass `RAW_DATA_DIR` so the report shows the raw-reads folder.
 
 ## Execution monitoring and self-repair
 

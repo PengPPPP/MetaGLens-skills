@@ -25,6 +25,8 @@ USE_MAXBIN2="{{USE_MAXBIN2}}"
 USE_CONCOCT="{{USE_CONCOCT}}"
 USE_DAS_TOOL="{{USE_DAS_TOOL}}"
 ASSEMBLY_STRATEGY="{{ASSEMBLY_STRATEGY}}"
+# Label used to prefix renamed bins for a co-binning (co-assembly) run.
+GROUP_LABEL="{{GROUP_LABEL}}"
 SAMPLES=({{SAMPLE_LIST}})
 
 # ===== Paths =====
@@ -34,6 +36,8 @@ LOG_DIR="${REPORTS_DIR}/logs"
 ASSEMBLY_DIR="${RESULTS_DIR}/02_assembly"
 MAPPING_DIR="${RESULTS_DIR}/03_mapping"
 OUTPUT_DIR="${RESULTS_DIR}/04_binning"
+# Collected, renamed bins ({label}_bin{N}.fa) from all samples for downstream stages.
+ALL_BINS_DIR="${OUTPUT_DIR}/all_bins"
 
 STATUS_FILE="${RESULTS_DIR}/pipeline_status.json"
 RUN_LOG="${REPORTS_DIR}/run_log.md"
@@ -58,194 +62,48 @@ check_prerequisite "03_mapping"
 update_step_status "${STEP_NAME}" "running"
 enable_step_failure_trap
 
-# ===== Resolve contig and depth files =====
+# ===== Parallel plan =====
+# Per-sample binning supports scheduler array jobs (one task per sample).
+# Co-binning is a single unit that uses all available threads.
+load_parallel_plan
+log "Parallel plan: exec_env=${EXEC_ENV}, jobs=${PARALLEL_JOBS}, threads/job=${THREADS_PER_JOB}, total=${TOTAL_THREADS}"
+
+# ===== Resolve binning units =====
+# Per-sample binning: one unit per sample, labeled by sample id.
+# Co-binning (co-assembly): a single unit over the shared contigs, labeled GROUP_LABEL.
 if [[ "${ASSEMBLY_STRATEGY}" == "co-assembly" ]]; then
-    COASSEMBLY_DIR="${ASSEMBLY_DIR}/coassembly"
-    CONTIGS_FILE="${COASSEMBLY_DIR}/final.contigs_filtered.fa"
-    [[ -f "${CONTIGS_FILE}" ]] || CONTIGS_FILE="${COASSEMBLY_DIR}/final.contigs.fa"
-    [[ -f "${CONTIGS_FILE}" ]] || CONTIGS_FILE="${COASSEMBLY_DIR}/contigs.fasta"
-    log "Co-assembly mode — contigs: ${CONTIGS_FILE}"
     SINGLE_CONTIG=true
+    BIN_UNITS=("coassembly")
+    COASSEMBLY_DIR="${ASSEMBLY_DIR}/coassembly"
+    COASSEMBLY_CONTIGS="${COASSEMBLY_DIR}/final.contigs_filtered.fa"
+    [[ -f "${COASSEMBLY_CONTIGS}" ]] || COASSEMBLY_CONTIGS="${COASSEMBLY_DIR}/final.contigs.fa"
+    [[ -f "${COASSEMBLY_CONTIGS}" ]] || COASSEMBLY_CONTIGS="${COASSEMBLY_DIR}/contigs.fasta"
+    log "Co-binning mode — shared contigs: ${COASSEMBLY_CONTIGS}"
 else
     SINGLE_CONTIG=false
+    BIN_UNITS=("${SAMPLES[@]}")
 fi
 
 # ===== Execution =====
 log_step "Starting binning"
 log "Min contig length: ${MIN_CONTIG} bp"
-log "Tools: metabat2=${USE_METABAT2}, maxbin2=${USE_MAXBIN2}, concoct=${USE_CONCOCT}"
-log "DAS Tool: ${USE_DAS_TOOL}"
-log "Threads: ${THREADS}"
-mkdir -p "${OUTPUT_DIR}"
+log "Tools: metabat2=${USE_METABAT2}, maxbin2=${USE_MAXBIN2}, concoct=${USE_CONCOCT}, DAS Tool=${USE_DAS_TOOL}"
+mkdir -p "${OUTPUT_DIR}" "${ALL_BINS_DIR}"
 
 START_TIME=$(date '+%H:%M')
 
-TOTAL_BINS_BEFORE=0
-TOTAL_BINS_AFTER=0
-
-# Bin each sample or the co-assembly
-if [[ "${SINGLE_CONTIG}" == true ]]; then
-    SAMPLE_LIST_BIN=("coassembly")
+# Restrict to this task's unit under a scheduler array job.
+mapfile -t RUN_UNITS < <(resolve_task_samples "${BIN_UNITS[@]}")
+# With a single binning unit, use all threads; otherwise split across parallel jobs.
+if [[ ${#RUN_UNITS[@]} -le 1 ]]; then
+    BIN_THREADS="${TOTAL_THREADS}"
 else
-    SAMPLE_LIST_BIN=("${SAMPLES[@]}")
+    BIN_THREADS="${THREADS_PER_JOB}"
 fi
 
-for SAMPLE in "${SAMPLE_LIST_BIN[@]}"; do
-    log_step "Binning: ${SAMPLE}"
-
-    # Resolve the contig file
-    if [[ "${SINGLE_CONTIG}" == true ]]; then
-        CUR_CONTIGS="${CONTIGS_FILE}"
-    else
-        CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs_filtered.fa"
-        [[ -f "${CUR_CONTIGS}" ]] || CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs.fa"
-        [[ -f "${CUR_CONTIGS}" ]] || CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
-    fi
-
-    # Resolve the depth file.
-    if [[ "${SINGLE_CONTIG}" == true ]]; then
-        DEPTH_FILE="${MAPPING_DIR}/coassembly_depth.txt"
-    else
-        DEPTH_FILE="${MAPPING_DIR}/${SAMPLE}/${SAMPLE}_depth.txt"
-    fi
-
-    if [[ ! -f "${CUR_CONTIGS}" ]]; then
-        log "ERROR: Contigs file not found: ${CUR_CONTIGS}"
-        exit 1
-    fi
-    log "  Contigs: ${CUR_CONTIGS}"
-
-    SAMPLE_OUT="${OUTPUT_DIR}/${SAMPLE}"
-    mkdir -p "${SAMPLE_OUT}"
-
-    # === MetaBAT2 ===
-    if [[ "${USE_METABAT2}" == "yes" ]]; then
-        log_step "Running MetaBAT2 for ${SAMPLE}"
-        mkdir -p "${SAMPLE_OUT}/metabat2"
-
-        if [[ -f "${DEPTH_FILE}" ]]; then
-            metabat2 \
-                -i "${CUR_CONTIGS}" \
-                -o "${SAMPLE_OUT}/metabat2/bin" \
-                -a "${DEPTH_FILE}" \
-                -m "${MIN_CONTIG}" \
-                -t "${THREADS}"
-        else
-            log "  WARNING: Depth file not found (${DEPTH_FILE}), running MetaBAT2 without abundance info..."
-            metabat2 \
-                -i "${CUR_CONTIGS}" \
-                -o "${SAMPLE_OUT}/metabat2/bin" \
-                -m "${MIN_CONTIG}" \
-                -t "${THREADS}"
-        fi
-
-        MB2_COUNT=$(find "${SAMPLE_OUT}/metabat2" -maxdepth 1 -type f -name 'bin.*.fa' | wc -l)
-        log "  MetaBAT2 bins: ${MB2_COUNT}"
-        TOTAL_BINS_BEFORE=$((TOTAL_BINS_BEFORE + MB2_COUNT))
-    fi
-
-    # === MaxBin2 ===
-    if [[ "${USE_MAXBIN2}" == "yes" ]]; then
-        log_step "Running MaxBin2 for ${SAMPLE}"
-        mkdir -p "${SAMPLE_OUT}/maxbin2"
-
-        if [[ -f "${DEPTH_FILE}" ]]; then
-            MAXBIN_ABUND="${SAMPLE_OUT}/maxbin2/abundance.tsv"
-            awk -F'\t' 'NR > 1 {print $1 "\t" $3}' "${DEPTH_FILE}" > "${MAXBIN_ABUND}"
-            run_MaxBin.pl \
-                -contig "${CUR_CONTIGS}" \
-                -abund "${MAXBIN_ABUND}" \
-                -out "${SAMPLE_OUT}/maxbin2/bin" \
-                -thread "${THREADS}" \
-                -min_contig_length "${MIN_CONTIG}"
-        else
-            log "  WARNING: No depth file, MaxBin2 may not perform optimally"
-            run_MaxBin.pl \
-                -contig "${CUR_CONTIGS}" \
-                -out "${SAMPLE_OUT}/maxbin2/bin" \
-                -thread "${THREADS}" \
-                -min_contig_length "${MIN_CONTIG}"
-        fi
-
-        # Normalize MaxBin2 .fasta output to .fa
-        for f in "${SAMPLE_OUT}/maxbin2/"*.fasta; do
-            [[ -e "${f}" ]] || continue
-            mv "${f}" "${f%.fasta}.fa"
-        done
-
-        MX2_COUNT=$(find "${SAMPLE_OUT}/maxbin2" -maxdepth 1 -type f -name 'bin.*.fa' | wc -l)
-        log "  MaxBin2 bins: ${MX2_COUNT}"
-        TOTAL_BINS_BEFORE=$((TOTAL_BINS_BEFORE + MX2_COUNT))
-    fi
-
-    # === CONCOCT ===
-    if [[ "${USE_CONCOCT}" == "yes" ]]; then
-        log_step "Running CONCOCT for ${SAMPLE}"
-        mkdir -p "${SAMPLE_OUT}/concoct"
-
-        # Step 1: Split contigs
-        log "  Cutting contigs..."
-        cut_up_fasta.py "${CUR_CONTIGS}" -c 10000 -o 0 --merge_last \
-            > "${SAMPLE_OUT}/concoct/contigs_10K.fa"
-
-        # Step 2: Build the BAM list
-        log "  Generating BAM list..."
-        if [[ "${SINGLE_CONTIG}" == true ]]; then
-            # Co-assembly: collect BAM files from all samples
-            > "${SAMPLE_OUT}/concoct/bam_list.txt"
-            for s in "${SAMPLES[@]}"; do
-                BAM_FILE="${MAPPING_DIR}/${s}/${s}.sorted.bam"
-                if [[ -f "${BAM_FILE}" ]]; then
-                    echo "${BAM_FILE}" >> "${SAMPLE_OUT}/concoct/bam_list.txt"
-                fi
-            done
-        else
-            BAM_FILE="${MAPPING_DIR}/${SAMPLE}/${SAMPLE}.sorted.bam"
-            if [[ -f "${BAM_FILE}" ]]; then
-                echo "${BAM_FILE}" > "${SAMPLE_OUT}/concoct/bam_list.txt"
-            else
-                : > "${SAMPLE_OUT}/concoct/bam_list.txt"
-            fi
-        fi
-
-        if [[ ! -s "${SAMPLE_OUT}/concoct/bam_list.txt" ]]; then
-            log "ERROR: CONCOCT requires at least one readable BAM file."
-            exit 1
-        fi
-
-        # Step 3: Build the coverage table
-        log "  Generating coverage table..."
-        concoct_coverage_table.py "${SAMPLE_OUT}/concoct/bam_list.txt" \
-            > "${SAMPLE_OUT}/concoct/coverage_table.tsv"
-
-        # Step 4: Cluster contigs
-        log "  Running CONCOCT clustering..."
-        concoct \
-            --composition_file "${SAMPLE_OUT}/concoct/contigs_10K.fa" \
-            --coverage_file "${SAMPLE_OUT}/concoct/coverage_table.tsv" \
-            -b "${SAMPLE_OUT}/concoct/" \
-            --threads "${THREADS}"
-
-        # Step 5: Merge subcontig assignments
-        log "  Merging subcontigs..."
-        merge_cutup_clustering.py "${SAMPLE_OUT}/concoct/clustering_gt1000.csv" \
-            > "${SAMPLE_OUT}/concoct/clustering_merged.csv"
-
-        # Step 6: Extract bins
-        log "  Extracting bins..."
-        extract_fasta_bins.py "${CUR_CONTIGS}" \
-            "${SAMPLE_OUT}/concoct/clustering_merged.csv" \
-            --output_path "${SAMPLE_OUT}/concoct/bins"
-
-        CC_COUNT=$(find "${SAMPLE_OUT}/concoct/bins" -maxdepth 1 -type f -name '*.fa' | wc -l)
-        log "  CONCOCT bins: ${CC_COUNT}"
-        TOTAL_BINS_BEFORE=$((TOTAL_BINS_BEFORE + CC_COUNT))
-    fi
-done
-
-# === DAS Tool refinement ===
+# Resolve the DAS Tool FASTA-to-contig2bin helper name once.
+FASTA_TO_CONTIG2BIN=""
 if [[ "${USE_DAS_TOOL}" == "yes" ]]; then
-    log_step "Running DAS Tool"
     if command -v Fasta_to_Contigs2Bin.sh &>/dev/null; then
         FASTA_TO_CONTIG2BIN="Fasta_to_Contigs2Bin.sh"
     elif command -v Fasta_to_Contig2Bin.sh &>/dev/null; then
@@ -254,69 +112,174 @@ if [[ "${USE_DAS_TOOL}" == "yes" ]]; then
         log "ERROR: DAS Tool FASTA-to-contig2bin helper was not found on PATH."
         exit 1
     fi
+fi
 
-    for SAMPLE in "${SAMPLE_LIST_BIN[@]}"; do
-        SAMPLE_OUT="${OUTPUT_DIR}/${SAMPLE}"
-        DAS_OUT="${SAMPLE_OUT}/das_tool"
+# Bin a single unit (sample or co-assembly), refine, then rename + collect bins.
+bin_unit() {
+    local SAMPLE="$1"
+    local CUR_CONTIGS DEPTH_FILE LABEL
+    local SAMPLE_OUT="${OUTPUT_DIR}/${SAMPLE}"
+    mkdir -p "${SAMPLE_OUT}"
+
+    # Naming label: co-binning uses GROUP_LABEL; per-sample uses the sample id.
+    if [[ "${SINGLE_CONTIG}" == true ]]; then
+        CUR_CONTIGS="${COASSEMBLY_CONTIGS}"
+        DEPTH_FILE="${MAPPING_DIR}/coassembly_depth.txt"
+        LABEL="${GROUP_LABEL}"
+    else
+        CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs_filtered.fa"
+        [[ -f "${CUR_CONTIGS}" ]] || CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs.fa"
+        [[ -f "${CUR_CONTIGS}" ]] || CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
+        DEPTH_FILE="${MAPPING_DIR}/${SAMPLE}/${SAMPLE}_depth.txt"
+        LABEL="${SAMPLE}"
+    fi
+
+    if [[ ! -f "${CUR_CONTIGS}" ]]; then
+        log "ERROR: Contigs file not found: ${CUR_CONTIGS}"
+        return 1
+    fi
+    log_step "Binning: ${SAMPLE} (label: ${LABEL})"
+    log "  [${SAMPLE}] Contigs: ${CUR_CONTIGS}"
+
+    # === MetaBAT2 ===
+    if [[ "${USE_METABAT2}" == "yes" ]]; then
+        mkdir -p "${SAMPLE_OUT}/metabat2"
+        if [[ -f "${DEPTH_FILE}" ]]; then
+            metabat2 -i "${CUR_CONTIGS}" -o "${SAMPLE_OUT}/metabat2/bin" \
+                -a "${DEPTH_FILE}" -m "${MIN_CONTIG}" -t "${BIN_THREADS}"
+        else
+            log "  [${SAMPLE}] WARNING: depth file missing (${DEPTH_FILE}); running MetaBAT2 without abundance."
+            metabat2 -i "${CUR_CONTIGS}" -o "${SAMPLE_OUT}/metabat2/bin" \
+                -m "${MIN_CONTIG}" -t "${BIN_THREADS}"
+        fi
+    fi
+
+    # === MaxBin2 ===
+    if [[ "${USE_MAXBIN2}" == "yes" ]]; then
+        mkdir -p "${SAMPLE_OUT}/maxbin2"
+        if [[ -f "${DEPTH_FILE}" ]]; then
+            awk -F'\t' 'NR > 1 {print $1 "\t" $3}' "${DEPTH_FILE}" > "${SAMPLE_OUT}/maxbin2/abundance.tsv"
+            run_MaxBin.pl -contig "${CUR_CONTIGS}" -abund "${SAMPLE_OUT}/maxbin2/abundance.tsv" \
+                -out "${SAMPLE_OUT}/maxbin2/bin" -thread "${BIN_THREADS}" -min_contig_length "${MIN_CONTIG}"
+        else
+            log "  [${SAMPLE}] WARNING: no depth file; MaxBin2 may not perform optimally."
+            run_MaxBin.pl -contig "${CUR_CONTIGS}" -out "${SAMPLE_OUT}/maxbin2/bin" \
+                -thread "${BIN_THREADS}" -min_contig_length "${MIN_CONTIG}"
+        fi
+        # Normalize MaxBin2 .fasta output to .fa
+        for f in "${SAMPLE_OUT}/maxbin2/"*.fasta; do
+            [[ -e "${f}" ]] || continue
+            mv "${f}" "${f%.fasta}.fa"
+        done
+    fi
+
+    # === CONCOCT ===
+    if [[ "${USE_CONCOCT}" == "yes" ]]; then
+        mkdir -p "${SAMPLE_OUT}/concoct"
+        cut_up_fasta.py "${CUR_CONTIGS}" -c 10000 -o 0 --merge_last \
+            > "${SAMPLE_OUT}/concoct/contigs_10K.fa"
+        : > "${SAMPLE_OUT}/concoct/bam_list.txt"
+        if [[ "${SINGLE_CONTIG}" == true ]]; then
+            # Co-binning: collect BAM files from all samples.
+            local s
+            for s in "${SAMPLES[@]}"; do
+                local co_bam="${MAPPING_DIR}/${s}/${s}.sorted.bam"
+                [[ -f "${co_bam}" ]] && echo "${co_bam}" >> "${SAMPLE_OUT}/concoct/bam_list.txt"
+            done
+        else
+            local ps_bam="${MAPPING_DIR}/${SAMPLE}/${SAMPLE}.sorted.bam"
+            [[ -f "${ps_bam}" ]] && echo "${ps_bam}" >> "${SAMPLE_OUT}/concoct/bam_list.txt"
+        fi
+        if [[ ! -s "${SAMPLE_OUT}/concoct/bam_list.txt" ]]; then
+            log "ERROR: CONCOCT requires at least one readable BAM file."
+            return 1
+        fi
+        concoct_coverage_table.py "${SAMPLE_OUT}/concoct/bam_list.txt" \
+            > "${SAMPLE_OUT}/concoct/coverage_table.tsv"
+        concoct --composition_file "${SAMPLE_OUT}/concoct/contigs_10K.fa" \
+            --coverage_file "${SAMPLE_OUT}/concoct/coverage_table.tsv" \
+            -b "${SAMPLE_OUT}/concoct/" --threads "${BIN_THREADS}"
+        merge_cutup_clustering.py "${SAMPLE_OUT}/concoct/clustering_gt1000.csv" \
+            > "${SAMPLE_OUT}/concoct/clustering_merged.csv"
+        extract_fasta_bins.py "${CUR_CONTIGS}" \
+            "${SAMPLE_OUT}/concoct/clustering_merged.csv" \
+            --output_path "${SAMPLE_OUT}/concoct/bins"
+    fi
+
+    # === Choose the final bin set for this unit ===
+    # With DAS Tool: integrate binners into a refined consensus set.
+    # Without DAS Tool: use the first enabled binner's output as the final set.
+    local FINAL_BIN_DIR=""
+    if [[ "${USE_DAS_TOOL}" == "yes" ]]; then
+        local DAS_OUT="${SAMPLE_OUT}/das_tool"
         mkdir -p "${DAS_OUT}"
-
-        BIN_TABLES=()
-        BIN_LABELS=()
-
+        local BIN_TABLES=() BIN_LABELS=()
         if [[ "${USE_METABAT2}" == "yes" ]]; then
-            TABLE="${DAS_OUT}/metabat2_contigs2bin.tsv"
-            "${FASTA_TO_CONTIG2BIN}" -i "${SAMPLE_OUT}/metabat2" -e fa > "${TABLE}"
-            BIN_TABLES+=("${TABLE}")
-            BIN_LABELS+=("metabat2")
+            "${FASTA_TO_CONTIG2BIN}" -i "${SAMPLE_OUT}/metabat2" -e fa > "${DAS_OUT}/metabat2_contigs2bin.tsv"
+            BIN_TABLES+=("${DAS_OUT}/metabat2_contigs2bin.tsv"); BIN_LABELS+=("metabat2")
         fi
         if [[ "${USE_MAXBIN2}" == "yes" ]]; then
-            TABLE="${DAS_OUT}/maxbin2_contigs2bin.tsv"
-            "${FASTA_TO_CONTIG2BIN}" -i "${SAMPLE_OUT}/maxbin2" -e fa > "${TABLE}"
-            BIN_TABLES+=("${TABLE}")
-            BIN_LABELS+=("maxbin2")
+            "${FASTA_TO_CONTIG2BIN}" -i "${SAMPLE_OUT}/maxbin2" -e fa > "${DAS_OUT}/maxbin2_contigs2bin.tsv"
+            BIN_TABLES+=("${DAS_OUT}/maxbin2_contigs2bin.tsv"); BIN_LABELS+=("maxbin2")
         fi
         if [[ "${USE_CONCOCT}" == "yes" ]]; then
-            TABLE="${DAS_OUT}/concoct_contigs2bin.tsv"
-            "${FASTA_TO_CONTIG2BIN}" -i "${SAMPLE_OUT}/concoct/bins" -e fa > "${TABLE}"
-            BIN_TABLES+=("${TABLE}")
-            BIN_LABELS+=("concoct")
+            "${FASTA_TO_CONTIG2BIN}" -i "${SAMPLE_OUT}/concoct/bins" -e fa > "${DAS_OUT}/concoct_contigs2bin.tsv"
+            BIN_TABLES+=("${DAS_OUT}/concoct_contigs2bin.tsv"); BIN_LABELS+=("concoct")
         fi
-
+        local BIN_ARGS LABEL_ARGS
         BIN_ARGS=$(IFS=,; echo "${BIN_TABLES[*]}")
         LABEL_ARGS=$(IFS=,; echo "${BIN_LABELS[*]}")
-
         if [[ -z "${BIN_ARGS}" ]]; then
-            log "  No bin sets to integrate — skipping DAS Tool"
+            log "  [${SAMPLE}] No bin sets to integrate — skipping DAS Tool."
         else
-            if [[ "${SINGLE_CONTIG}" == true ]]; then
-                CUR_CONTIGS="${CONTIGS_FILE}"
-            else
-                CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs_filtered.fa"
-                [[ -f "${CUR_CONTIGS}" ]] || CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/final.contigs.fa"
-                [[ -f "${CUR_CONTIGS}" ]] || CUR_CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
-            fi
-
-            DAS_Tool \
-                -i "${BIN_ARGS}" \
-                -l "${LABEL_ARGS}" \
-                -c "${CUR_CONTIGS}" \
-                -o "${DAS_OUT}/DASTool" \
-                -t "${THREADS}" \
-                --score_threshold 0.5 \
-                --write_bins
-
-            DAS_BIN_DIR="${DAS_OUT}/DASTool_DASTool_bins"
-            DAS_COUNT=$(find "${DAS_BIN_DIR}" -maxdepth 1 -type f -name '*.fa' | wc -l)
-            log "  DAS Tool ${SAMPLE}: ${DAS_COUNT} refined bins"
-            TOTAL_BINS_AFTER=$((TOTAL_BINS_AFTER + DAS_COUNT))
+            DAS_Tool -i "${BIN_ARGS}" -l "${LABEL_ARGS}" -c "${CUR_CONTIGS}" \
+                -o "${DAS_OUT}/DASTool" -t "${BIN_THREADS}" \
+                --score_threshold 0.5 --write_bins
+            FINAL_BIN_DIR="${DAS_OUT}/DASTool_DASTool_bins"
         fi
+    fi
+    if [[ -z "${FINAL_BIN_DIR}" ]]; then
+        # No DAS Tool (or nothing to integrate): pick the first enabled binner.
+        if [[ "${USE_METABAT2}" == "yes" ]]; then FINAL_BIN_DIR="${SAMPLE_OUT}/metabat2"
+        elif [[ "${USE_MAXBIN2}" == "yes" ]]; then FINAL_BIN_DIR="${SAMPLE_OUT}/maxbin2"
+        elif [[ "${USE_CONCOCT}" == "yes" ]]; then FINAL_BIN_DIR="${SAMPLE_OUT}/concoct/bins"
+        fi
+    fi
+
+    # === Rename final bins to {label}_bin{N}.fa and collect into all_bins/ ===
+    local before_count=0 after_count=0
+    shopt -s nullglob
+    local final_bins=("${FINAL_BIN_DIR}"/*.fa "${FINAL_BIN_DIR}"/*.fna "${FINAL_BIN_DIR}"/*.fasta)
+    shopt -u nullglob
+    before_count=${#final_bins[@]}
+    local n=0 bin
+    for bin in "${final_bins[@]}"; do
+        n=$((n + 1))
+        cp "${bin}" "${ALL_BINS_DIR}/${LABEL}_bin${n}.fa"
+        after_count=$((after_count + 1))
     done
-fi
+    log "  [${SAMPLE}] Final bins: ${before_count}; collected as ${LABEL}_bin*.fa"
+    printf '%d\t%d\n' "${before_count}" "${after_count}" > "${SAMPLE_OUT}/.bincount"
+}
+
+log "Binning ${#RUN_UNITS[@]} unit(s) with up to ${PARALLEL_JOBS} concurrent job(s); ${BIN_THREADS} threads/unit."
+run_parallel "${PARALLEL_JOBS}" bin_unit "${RUN_UNITS[@]}"
+
+# ===== Aggregate counts =====
+TOTAL_BINS=0
+for UNIT in "${RUN_UNITS[@]}"; do
+    CFILE="${OUTPUT_DIR}/${UNIT}/.bincount"
+    if [[ -f "${CFILE}" ]]; then
+        IFS=$'\t' read -r B _A < "${CFILE}"
+        TOTAL_BINS=$((TOTAL_BINS + B))
+    fi
+done
+COLLECTED_TOTAL=$(find "${ALL_BINS_DIR}" -maxdepth 1 -type f -name '*.fa' | wc -l)
 
 # ===== Summary =====
 log_step "Binning Summary"
-log "Total bins before DAS Tool: ${TOTAL_BINS_BEFORE}"
-log "Total refined bins: ${TOTAL_BINS_AFTER}"
+log "Total final bins produced: ${TOTAL_BINS}"
+log "Collected renamed bins in ${ALL_BINS_DIR}/: ${COLLECTED_TOTAL}"
 log "Output directory: ${OUTPUT_DIR}/"
 
 # ===== Update status and run log =====
@@ -328,11 +291,12 @@ if [[ -f "${RUN_LOG}" ]]; then
     cat >> "${RUN_LOG}" << EOFRUNLOGBIN
 
 ### 04 Binning (Binning)
-- **Tool**: MetaBAT2=${USE_METABAT2}, MaxBin2=${USE_MAXBIN2}, CONCOCT=${USE_CONCOCT}
+- **Tools**: MetaBAT2=${USE_METABAT2}, MaxBin2=${USE_MAXBIN2}, CONCOCT=${USE_CONCOCT}
 - **DAS Tool refinement**: ${USE_DAS_TOOL}
+- **Binning strategy**: ${ASSEMBLY_STRATEGY}
 - **Minimum contig length**: ${MIN_CONTIG} bp
-- **Total bins before refinement**: ${TOTAL_BINS_BEFORE}
-- **Total bins after refinement**: ${TOTAL_BINS_AFTER}
+- **Total final bins**: ${TOTAL_BINS}
+- **Collected (renamed {label}_bin{N}.fa)**: ${COLLECTED_TOTAL} in all_bins/
 - **Output**: ${OUTPUT_DIR}/
 - **Detailed log**: logs/04_binning.log
 
@@ -340,4 +304,4 @@ EOFRUNLOGBIN
 fi
 
 log_step "Binning completed"
-echo "Next step: bash 05_bin_evaluation.sh"
+echo "Next step: bash 05_bin_evaluation.sh (use BINS_DIR=${ALL_BINS_DIR})"
