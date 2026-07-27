@@ -1,3 +1,5 @@
+![MetaGLens Skills banner](assets/metaglens-banner.png)
+
 # MetaGLens Skills: AI-orchestrated metagenomics: reads → MAGs → annotation
 
 ![MetaGLens workflow demonstration](assets/metaglens-workflow-demo.gif)

@@ -3,6 +3,8 @@
 # uses the ASCII copies under assets/ and shared/templates/ instead.
 /MetaGLens-skills*.png
 /MetaGLens-skills*.gif
+# Loose drop-in image (banner source); repo uses assets/metaglens-banner.png
+/ab66083b8d7f4b3481615b0ea61f13bb.png
 
 # ==== Example previews kept local ====
 # Development demo (mock data / "Demo" badge) and the intermediate logo crop
